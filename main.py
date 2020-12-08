@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import queue
+import time
 
 colorB = (128, 232, 70, 156, 153, 153, 30,  0,   35, 152, 180, 60,  0,  142, 70,  100, 100, 230, 32)
 colorG = (64,  35, 70, 102, 153, 153, 170, 220, 142, 251, 130, 20, 0,  0,   0,   60,  80,  0,   11)
@@ -17,12 +18,11 @@ colorR = (128, 244, 70,  102, 190, 153, 250, 220, 107, 152, 70,  220, 255, 0,   
 
 global isCapturing
 
-def streamCapture(url, queueIn):
+def streamCapture(stream, queueIn):
     global isCapturing
     print('Capture stream from {}'.format(url))
-    video = pafy.new(url)
-    stream = video.streams[2]
     cap = cv2.VideoCapture(stream.url)
+    frame_id = 0
     while cap.isOpened():
         ret, frame = cap.read()
         isCapturing = True
@@ -30,22 +30,27 @@ def streamCapture(url, queueIn):
         if not ret:
             isCapturing = False
             break
-        queueIn.put(frame)
+        queueIn.put((frame_id, frame))
+        frame_id = frame_id + 1
 
     cap.release()
 
 
-def display(ip, port, queueOut):
+def outputStream(ip, port, queueOut):
     global isCapturing
     width, height = 512, 256
     pipeline = 'appsrc ! videoconvert ! video/x-raw,format=I420,width={},height={} ! videoconvert ! jpegenc ! rtpjpegpay ! queue ! udpsink host={}  port={}'.format(width, height, ip, port)
     out = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, 30, (width, height), True)
     print(pipeline)
-
     while isCapturing:
-        frame = queueOut.get()
-        #print('Write frame')
-        out.write(frame)
+        frame_id, (img_ori, pred_labels) = queueOut.get()
+        seg_mask = label_to_pixel(pred_labels)
+        seg_mask = cv2.resize(seg_mask, (width, height), interpolation=cv2.INTER_NEAREST) 
+        # overlay original image with segmentation mask
+        img_out = cv2.addWeighted(img_ori, 0.4, seg_mask, 0.6, 0)
+
+        prev = frame_id 
+        out.write(img_out)
 
     out.release()
 
@@ -56,7 +61,13 @@ def label_to_pixel(img):
 
     return result
 
-def runSegmentation(worker, dpu, queueIn, queueout):
+def normalize(img):
+    mean = (104.0, 117.0, 123.0);
+    img  = img.astype(np.float32)
+    img  = img - mean
+    return img
+
+def runSegmentation(worker, dpu, queueIn, queueOut):
     global isCapturing
     print('Worker: {}'.format(worker))
     inputTensors  = dpu.get_input_tensors()
@@ -73,12 +84,12 @@ def runSegmentation(worker, dpu, queueIn, queueout):
     #print(outputWidth, outputHeight)
     while isCapturing:
         if queueIn.empty():
+            time.sleep(0.2)
             continue
-        frame = queueIn.get() 
-        frame = cv2.resize(frame, (inputWidth, inputHeight), interpolation=cv2.INTER_LINEAR) 
-        img = frame.astype(np.float32)
-        mean = (104.0, 117.0, 123.0);
-        img = img - mean
+        frame_id, img_ori = queueIn.get() 
+        #img_ori = cv2.resize(img_ori, (inputWidth, inputHeight), interpolation=cv2.INTER_LINEAR) 
+        img_ori = img_ori[60:60+inputHeight, 0:inputWidth]
+        img     = normalize(img_ori)
 
         outputData = []
         inputData  = []
@@ -91,13 +102,9 @@ def runSegmentation(worker, dpu, queueIn, queueout):
         job_id = dpu.execute_async(inputData, outputData)
         dpu.wait(job_id)
 
-        pred_label = np.argmax(outputData[0][0], axis=-1) 
-        seg_img = label_to_pixel(pred_label)
-        seg_img = cv2.resize(seg_img, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) 
-        out_img = cv2.addWeighted(frame, 0.4, seg_img, 0.6, 0)
-
+        pred_labels = np.argmax(outputData[0][0], axis=-1) 
+        queueOut.put((frame_id, (img_ori, pred_labels)))
         #print('Prediction done')
-        queueout.put(out_img)
 
 
 def get_subgraph(g):
@@ -107,50 +114,50 @@ def get_subgraph(g):
     return sub
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print('Usage {} <dpu model file>'.format(sys.argv[0]))
-        exit(-1)
-
-    model = sys.argv[1]
-    g = xir.graph.Graph.deserialize(pathlib.Path(model))
-    subgraphs = get_subgraph (g)
-    assert len(subgraphs) == 1 # only one DPU kernel
-
-    global isCapturing
+    # Change variables below for your setup
+    threads = 2
     ip      = '192.168.3.2'
     port    = '1234'
     url     = 'https://www.youtube.com/watch?v=lkIJYc4UH60'
-    threads = 2
+    model   = 'model/fpn.elf' 
 
-    all_dpu_runners = [];
+    g = xir.graph.Graph.deserialize(pathlib.Path(model))
+    subgraphs = get_subgraph (g)
+    assert len(subgraphs) == 1 
+
+    dpu_runners = [];
     for i in range(int(threads)):
-        all_dpu_runners.append(runner.Runner(subgraphs[0], "run"));
+        dpu_runners.append(runner.Runner(subgraphs[0], "run"));
 
     # Init synchronous queues for inter-thread communication
-    queueIn = queue.Queue()
-    queueOut = queue.Queue()
+    queueIn  = queue.Queue()
+    queueOut = queue.PriorityQueue()
 
     # Launch threads
     threadAll = []
-    sc = threading.Thread(target=streamCapture, args=(url, queueIn))
-    threadAll.append(sc)
+    video = pafy.new(url)
+    stream = video.streams[2]
+    taskCapture = threading.Thread(target=streamCapture, args=(stream, queueIn))
+    threadAll.append(taskCapture)
 
     for i in range(threads):
-        tw = threading.Thread(target=runSegmentation, args=(i, all_dpu_runners[i], queueIn, queueOut))
-        threadAll.append(tw)
+        taskPrediction = threading.Thread(target=runSegmentation, args=(i, dpu_runners[i], queueIn, queueOut))
+        threadAll.append(taskPrediction)
 
-    td = threading.Thread(target=display, args=(ip, port, queueOut))
-    threadAll.append(td)
+    taskDisplay = threading.Thread(target=outputStream, args=(ip, port, queueOut))
+    threadAll.append(taskDisplay)
 
+    global isCapturing
     isCapturing = True
-    for x in threadAll:
-        x.start()
+
+    for t in threadAll:
+        t.start()
 
     # Wait for all threads to stop
-    for x in threadAll:
-        x.join()
+    for t in threadAll:
+        t.join()
 
     # clean up resources
-    for runner in all_dpu_runners:
+    for runner in dpu_runners:
         del runner
 
